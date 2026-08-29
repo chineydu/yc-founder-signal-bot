@@ -1,0 +1,46 @@
+name: YC Founder Signal Monitor
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore monitoring state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.db
+          key: yc-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            yc-state-${{ runner.os }}-
+
+      - name: Run YC Founder Signal Monitor
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          POND_WEBHOOK_URL: ${{ secrets.POND_WEBHOOK_URL }}
+          POLL_HOURS: "6"
+          GOOGLE_NEWS_ENABLED: "true"
+          DB_PATH: "state.db"
+        run: python -c "import app; app.run_once()"
+
+      - name: Save monitoring state
+        uses: actions/cache/save@v4
+        with:
+          path: state.db
+          key: yc-state-${{ runner.os }}-${{ github.run_id }}
