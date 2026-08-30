@@ -156,12 +156,6 @@ def poll_social_search():
 
 def run_once():
     log.info("Starting monitoring run")
-    test_item = {
-        "key": f"test:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-        "source": "Test",
-        "text": "✅ YC Founder Signal Monitor — Slack connection test successful."
-    }
-    slack_alert(test_item)
     for fn in (poll_yc_directory, poll_speedrun, poll_social_search):
         try:
             fn()
