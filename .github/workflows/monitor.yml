@@ -34,8 +34,9 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           POND_WEBHOOK_URL: ${{ secrets.POND_WEBHOOK_URL }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          SOCIAL_SEARCH_ENABLED: "true"
           POLL_HOURS: "6"
-          GOOGLE_NEWS_ENABLED: "true"
           DB_PATH: "state.db"
         run: python -c "import app; app.run_once()"
 
