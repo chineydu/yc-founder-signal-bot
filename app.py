@@ -20,6 +20,7 @@ SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_ID", "")
 POND_WEBHOOK_URL = os.getenv("POND_WEBHOOK_URL", "")
 SOCIAL_SEARCH_ENABLED = os.getenv("SOCIAL_SEARCH_ENABLED", "true").lower() == "true"
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
 
 YC_DIRECTORY = "https://www.ycombinator.com/companies"
 YC_SPEEDRUN = "https://www.ycombinator.com/companies?tags=Speedrun"
@@ -131,7 +132,7 @@ def social_queries():
     common = '("got into YC" OR "accepted into YC" OR "YC S26" OR "Y Combinator" OR "backed by Y Combinator" OR "Speedrun batch")'
     return {
         "X": [f'site:x.com {common}', f'site:twitter.com {common}'],
-        "LinkedIn": [f'site:linkedin.com/posts {common}', f'site:linkedin.com/company {common}'],
+        "LinkedIn": [f'site:linkedin.com/posts {common}', f'site:linkedin.com/feed/update {common}', f'site:linkedin.com/company {common}'],
     }
 
 
@@ -148,12 +149,35 @@ def infer_company(text):
     return "Unknown — see original post"
 
 
+def is_early_yc_signal(text):
+    hay = text.casefold()
+    yc_terms = ("got into yc", "accepted into yc", "yc s26", "y combinator", "backed by y combinator", "speedrun")
+    announcement_terms = ("got into", "accepted", "backed", "joined yc", "join yc", "yc s26", "speedrun", "selected")
+    return any(k in hay for k in yc_terms) and any(k in hay for k in announcement_terms)
+
+
+def emit_social(platform, link, text, author="Unknown founder", company=None):
+    if not is_early_yc_signal(text):
+        return
+    company = company or infer_company(text)
+    emit({
+        "key": f"social:{platform}:{link}", "source": platform, "company": company, "url": link,
+        "text": (
+            "*EARLY YC SIGNAL — Founder Announced Before YC*\n\n"
+            f"Company: {company}\nFounder: {author}\nBatch/program: YC / Speedrun (from post)\n"
+            f"Source: {platform}\nStatus: ⚡ Founder/social announcement detected; not yet confirmed by YC Directory\n\n"
+            f"Original post: {link}\n\nPost text: {text[:900]}"
+        ),
+    })
+
+
 def social_feed(query):
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=en-US&gl=US&ceid=US:en"
     return feedparser.parse(url)
 
 
-def poll_social_platform(platform, queries, yc_names):
+def poll_social_search(platform, queries, yc_names):
+    """Fallback discovery layer for public X/LinkedIn pages indexed by Google News."""
     for query in queries:
         feed = social_feed(query)
         for entry in feed.entries[:30]:
@@ -162,27 +186,58 @@ def poll_social_platform(platform, queries, yc_names):
             summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" ", strip=True)
             author = entry.get("author", "") or "Unknown founder"
             text = f"{title} {summary}"
-            hay = text.casefold()
             if platform == "X" and not ("x.com/" in link or "twitter.com/" in link):
                 continue
             if platform == "LinkedIn" and "linkedin.com" not in link:
                 continue
-            if not any(k in hay for k in ("got into yc", "accepted into yc", "yc s26", "y combinator", "backed by y combinator", "speedrun")):
-                continue
-            if not any(k in hay for k in ("got into", "accepted", "backed", "joined yc", "join yc", "yc s26", "speedrun")):
-                continue
             company = infer_company(text)
             if company.casefold() in yc_names:
                 continue
-            emit({
-                "key": f"social:{platform}:{link}", "source": platform, "company": company, "url": link,
-                "text": (
-                    "*EARLY YC SIGNAL — Founder Announced Before YC*\n\n"
-                    f"Company: {company}\nFounder: {author}\nBatch/program: YC / Speedrun (from post)\n"
-                    f"Source: {platform}\nStatus: ⚡ Founder/social announcement detected; not yet confirmed by YC Directory\n\n"
-                    f"Original post: {link}\n\nPost text: {text[:900]}"
-                ),
-            })
+            emit_social(platform, link, text, author, company)
+
+
+def x_api_query():
+    return '("got into YC" OR "accepted into YC" OR "YC S26" OR "Y Combinator" OR "backed by Y Combinator" OR "Speedrun") -is:retweet lang:en'
+
+
+def poll_x_api(yc_names):
+    """Direct X API detection. Falls back to indexed search when no token is configured."""
+    if not X_BEARER_TOKEN:
+        log.info("X_BEARER_TOKEN not configured; using indexed X discovery")
+        return False
+    params = {
+        "query": x_api_query(),
+        "max_results": 100,
+        "tweet.fields": "created_at,author_id",
+        "expansions": "author_id",
+        "user.fields": "username,name",
+    }
+    r = requests.get(
+        "https://api.x.com/2/tweets/search/recent",
+        headers={"Authorization": f"Bearer {X_BEARER_TOKEN}"},
+        params=params,
+        timeout=30,
+    )
+    if r.status_code in (401, 403):
+        log.error("X API authentication/access failed (%s): %s", r.status_code, r.text[:500])
+        return False
+    if r.status_code == 429:
+        log.warning("X API rate limit reached; indexed discovery will still run")
+        return False
+    r.raise_for_status()
+    payload = r.json()
+    users = {u["id"]: u for u in payload.get("includes", {}).get("users", [])}
+    for post in payload.get("data", []):
+        author = users.get(post.get("author_id"), {})
+        username = author.get("username", "")
+        author_label = f"@{username}" if username else author.get("name", "Unknown founder")
+        link = f"https://x.com/{username}/status/{post['id']}" if username else f"https://x.com/i/web/status/{post['id']}"
+        text = post.get("text", "")
+        company = infer_company(text)
+        if company.casefold() in yc_names:
+            continue
+        emit_social("X", link, text, author_label, company)
+    return True
 
 
 def run_once():
@@ -194,11 +249,18 @@ def run_once():
             log.exception("Source failed: %s", fn.__name__)
     if SOCIAL_SEARCH_ENABLED:
         yc_names = yc_company_names()
-        for platform, fn in (("X", lambda: poll_social_platform("X", social_queries()["X"], yc_names)), ("LinkedIn", lambda: poll_social_platform("LinkedIn", social_queries()["LinkedIn"], yc_names))):
-            try:
-                fn()
-            except Exception:
-                log.exception("Source failed: %s", platform)
+        try:
+            poll_x_api(yc_names)
+        except Exception:
+            log.exception("Source failed: X API")
+        try:
+            poll_social_search("X", social_queries()["X"], yc_names)
+        except Exception:
+            log.exception("Source failed: X indexed discovery")
+        try:
+            poll_social_search("LinkedIn", social_queries()["LinkedIn"], yc_names)
+        except Exception:
+            log.exception("Source failed: LinkedIn indexed discovery")
     conn = db()
     conn.execute("INSERT INTO runs(ran_at) VALUES(?)", (datetime.now(timezone.utc).isoformat(),))
     conn.commit()
