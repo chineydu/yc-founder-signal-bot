@@ -1,16 +1,61 @@
-"""Small Pond compatibility hook for the Render/Flask process.
-
-Pond's publisher currently probes GET /tasks/{task_id} while validating the
-Access Key even when the manifest advertises synchronous execution. The
-production Agent remains synchronous; this hook only exposes a safe polling
-endpoint for Pond's reachability probe.
-"""
+"""Runtime compatibility hooks for the Render/Flask Pond Agent."""
 
 import os
+import re
+import sqlite3
 
 from flask import Flask, jsonify, request
 
 _original_flask_run = Flask.run
+_original_sqlite_connect = sqlite3.connect
+
+
+class _PostgresCursorCompat:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, params=()):
+        sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        if "INSERT INTO seen" in sql and "ON CONFLICT" not in sql:
+            sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        sql = re.sub(r"runs\(id INTEGER PRIMARY KEY, ran_at TEXT\)", "runs(id BIGSERIAL PRIMARY KEY, ran_at TEXT)", sql)
+        sql = sql.replace("?", "%s")
+        self._cursor.execute(sql, params)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+class _PostgresConnectionCompat:
+    """Tiny sqlite-like adapter so the existing monitor can use Render Postgres."""
+
+    def __init__(self, url):
+        import psycopg
+        self._conn = psycopg.connect(url)
+
+    def execute(self, sql, params=()):
+        cursor = self._conn.cursor()
+        return _PostgresCursorCompat(cursor).execute(sql, params)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+def _connect(database, *args, **kwargs):
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        return _PostgresConnectionCompat(database_url)
+    return _original_sqlite_connect(database, *args, **kwargs)
+
+
+sqlite3.connect = _connect
 
 
 def _pond_compatible_run(self, *args, **kwargs):
@@ -26,10 +71,6 @@ def _pond_compatible_run(self, *args, **kwargs):
             if request.headers.get("X-Agent-Protocol-Version") != "1.0":
                 return jsonify({"error": {"code": "invalid_request", "message": "X-Agent-Protocol-Version must be exactly 1.0."}}), 400
 
-            # Pond uses this synthetic ID to check that the endpoint is reachable.
-            # The Agent itself never creates async tasks, so there is no real task
-            # to return for the probe. Return a valid terminal failure rather than
-            # a framework-level 404 so Pond can complete its endpoint validation.
             if task_id.startswith("task_pond_reachability_probe_"):
                 return jsonify({
                     "run_id": task_id,
