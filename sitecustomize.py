@@ -35,7 +35,7 @@ class _PostgresConnectionCompat:
 
     def __init__(self, url):
         import psycopg
-        self._conn = psycopg.connect(url)
+        self._conn = psycopg.connect(url, connect_timeout=15)
 
     def execute(self, sql, params=()):
         cursor = self._conn.cursor()
