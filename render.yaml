@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: python server.py
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
