@@ -18,7 +18,7 @@ class _PostgresCursorCompat:
         sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
         if "INSERT INTO seen" in sql and "ON CONFLICT" not in sql:
             sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
-        sql = re.sub(r"runs\(id INTEGER PRIMARY KEY, ran_at TEXT\)", "runs(id BIGSERIAL PRIMARY KEY, ran_at TEXT)", sql)
+        sql = re.sub(r"runs\s*\(id INTEGER PRIMARY KEY, ran_at TEXT\)", "runs(id BIGSERIAL PRIMARY KEY, ran_at TEXT)", sql)
         sql = sql.replace("?", "%s")
         self._cursor.execute(sql, params)
         return self
