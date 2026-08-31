@@ -9,7 +9,7 @@ from urllib.parse import quote_plus
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
+from flask import Flask, jsonify, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("yc-signal")
@@ -19,6 +19,7 @@ POLL_HOURS = float(os.getenv("POLL_HOURS", "8"))
 SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_ID", "")
 POND_WEBHOOK_URL = os.getenv("POND_WEBHOOK_URL", "")
+POND_ACCESS_KEY = os.getenv("POND_ACCESS_KEY", "")
 SOCIAL_SEARCH_ENABLED = os.getenv("SOCIAL_SEARCH_ENABLED", "true").lower() == "true"
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
 
@@ -32,6 +33,7 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, source TEXT, url TEXT, company TEXT, created_at TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, ran_at TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS pond_runs (run_id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL)")
     conn.commit()
     return conn
 
@@ -221,6 +223,9 @@ def poll_x_api(yc_names):
     if r.status_code in (401, 403):
         log.error("X API authentication/access failed (%s): %s", r.status_code, r.text[:500])
         return False
+    if r.status_code == 402:
+        log.error("X API billing/access restriction (402): %s", r.text[:500])
+        return False
     if r.status_code == 429:
         log.warning("X API rate limit reached; indexed discovery will still run")
         return False
@@ -242,35 +247,102 @@ def poll_x_api(yc_names):
 
 def run_once():
     log.info("Starting monitoring run")
+    failures = []
     for fn in (poll_yc_directory, poll_speedrun):
         try:
             fn()
         except Exception:
+            failures.append(fn.__name__)
             log.exception("Source failed: %s", fn.__name__)
     if SOCIAL_SEARCH_ENABLED:
         yc_names = yc_company_names()
         try:
             poll_x_api(yc_names)
         except Exception:
+            failures.append("X API")
             log.exception("Source failed: X API")
         try:
             poll_social_search("X", social_queries()["X"], yc_names)
         except Exception:
+            failures.append("X indexed discovery")
             log.exception("Source failed: X indexed discovery")
         try:
             poll_social_search("LinkedIn", social_queries()["LinkedIn"], yc_names)
         except Exception:
+            failures.append("LinkedIn indexed discovery")
             log.exception("Source failed: LinkedIn indexed discovery")
     conn = db()
     conn.execute("INSERT INTO runs(ran_at) VALUES(?)", (datetime.now(timezone.utc).isoformat(),))
     conn.commit()
     conn.close()
     log.info("Monitoring run complete")
+    return failures
+
+
+def pond_authorized():
+    if not POND_ACCESS_KEY:
+        return False
+    auth = request.headers.get("Authorization", "")
+    return auth == f"Bearer {POND_ACCESS_KEY}"
+
+
+def pond_protocol_ok():
+    return request.headers.get("X-Agent-Protocol-Version") == "1.0"
+
+
+def pond_error(code, message, status=400):
+    return jsonify({"error": {"code": code, "message": message}}), status
+
+
+def pond_manifest():
+    return {
+        "protocol": "marketplace-agent",
+        "protocol_version": "1.0",
+        "agent_version": "2026.08.31.1",
+        "metadata": {
+            "name": "YC Founder Signal Monitor",
+            "short_description": "Monitors YC, Speedrun, and public founder announcements and sends qualified signals to Slack.",
+            "description": "Finds newly confirmed YC companies and early founder announcements before YC directory confirmation. Direct X API access is optional; when unavailable, indexed public discovery remains available.",
+        },
+        "actions": [
+            {
+                "id": "scan_yc_signals",
+                "name": "Scan YC founder signals",
+                "description": "Run the YC Founder Signal Monitor now and report the monitoring result, including any source limitations.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "include_social": {
+                            "type": "boolean",
+                            "description": "Whether to include public X and LinkedIn indexed founder-announcement discovery.",
+                        }
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+        "capabilities": {
+            "sync": True,
+            "streaming": False,
+            "async_tasks": False,
+            "cancellation": False,
+            "attachments": False,
+            "feedback": False,
+        },
+        "input_modes": ["text/plain"],
+        "output_modes": ["text/markdown"],
+        "limits": {
+            "max_request_bytes": 1048576,
+            "max_attachment_bytes": 0,
+            "max_run_seconds": 120,
+        },
+    }
 
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "yc-founder-signal", "poll_hours": POLL_HOURS}
+    return {"ok": True, "service": "yc-founder-signal", "pond_protocol": "1.0", "poll_hours": POLL_HOURS}
 
 
 @app.get("/health")
@@ -278,7 +350,88 @@ def health2():
     return {"ok": True}
 
 
+@app.get("/manifest")
+def manifest():
+    return jsonify(pond_manifest())
+
+
+@app.post("/runs")
+def pond_run():
+    if not pond_authorized():
+        return pond_error("unauthorized", "Missing or incorrect Pond Access Key.", 401)
+    if not pond_protocol_ok():
+        return pond_error("invalid_request", "X-Agent-Protocol-Version must be exactly 1.0.", 400)
+
+    payload = request.get_json(silent=True) or {}
+    run_id = payload.get("run_id")
+    if not run_id:
+        return pond_error("invalid_request", "run_id is required.", 400)
+    if payload.get("action_id") != "scan_yc_signals":
+        return pond_error("unsupported_operation", "action_id must be scan_yc_signals.", 400)
+    execution = payload.get("execution") or {}
+    if execution.get("accepted_output_modes") and "text/markdown" not in execution["accepted_output_modes"]:
+        return pond_error("unsupported_media_type", "This Agent returns text/markdown.", 400)
+    deadline_ms = execution.get("deadline_ms")
+    if deadline_ms is not None and deadline_ms > 120000:
+        return pond_error("invalid_request", "deadline_ms exceeds the Agent limit.", 400)
+
+    import hashlib
+    import json
+    request_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    conn = db()
+    existing = conn.execute("SELECT request_hash, response_json FROM pond_runs WHERE run_id=?", (run_id,)).fetchone()
+    if existing:
+        if existing[0] != request_hash:
+            conn.close()
+            return pond_error("idempotency_conflict", "run_id was already used with a different request.", 409)
+        response = json.loads(existing[1])
+        conn.close()
+        return jsonify(response), 200
+
+    params = payload.get("parameters") or {}
+    if "include_social" in params:
+        SOCIAL_SEARCH_ENABLED_LOCAL = params["include_social"]
+    else:
+        SOCIAL_SEARCH_ENABLED_LOCAL = SOCIAL_SEARCH_ENABLED
+
+    original_social = globals()["SOCIAL_SEARCH_ENABLED"]
+    globals()["SOCIAL_SEARCH_ENABLED"] = bool(SOCIAL_SEARCH_ENABLED_LOCAL)
+    try:
+        failures = run_once()
+    finally:
+        globals()["SOCIAL_SEARCH_ENABLED"] = original_social
+
+    if failures:
+        result_text = (
+            "YC Founder Signal Monitor completed with limitations.\n\n"
+            f"Sources with errors: {', '.join(failures)}.\n"
+            "The workflow continues running and reports source failures rather than treating them as a successful source result."
+        )
+    else:
+        result_text = "YC Founder Signal Monitor completed successfully. YC and enabled social discovery sources were checked and qualified signals were sent through the configured alert pipeline."
+
+    response = {
+        "run_id": run_id,
+        "status": "completed",
+        "output": [{"type": "text", "text": result_text}],
+        "usage": {"unit_of_measurement": "result", "quantity": 1},
+    }
+    conn = db()
+    conn.execute(
+        "INSERT INTO pond_runs(run_id, request_hash, response_json, created_at) VALUES(?,?,?,?)",
+        (run_id, request_hash, json.dumps(response), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(response), 200
+
+
 if __name__ == "__main__":
-    while True:
-        run_once()
-        time.sleep(max(300, int(POLL_HOURS * 3600)))
+    # Render web services provide PORT; GitHub Actions/local worker mode does not.
+    port = int(os.getenv("PORT", "0"))
+    if port:
+        app.run(host="0.0.0.0", port=port)
+    else:
+        while True:
+            run_once()
+            time.sleep(max(300, int(POLL_HOURS * 3600)))
