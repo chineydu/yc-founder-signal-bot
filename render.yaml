@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: yc-founder-signal-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: POLL_HOURS
+        value: "8"
+      - key: SOCIAL_SEARCH_ENABLED
+        value: "true"
+      - key: DB_PATH
+        value: /var/data/state.db
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_CHANNEL_ID
+        sync: false
+      - key: X_BEARER_TOKEN
+        sync: false
+      - key: POND_ACCESS_KEY
+        sync: false
+      - key: POND_WEBHOOK_URL
+        sync: false
