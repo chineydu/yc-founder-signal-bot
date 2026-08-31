@@ -1,52 +1,72 @@
 # YC Founder Signal Bot
 
-A single-workspace Slack monitoring worker for YC and YC Speedrun company signals.
+A Slack monitoring agent for YC and YC Speedrun company signals, with a Pond Protocol V1 interface.
 
 ## What it monitors
 
 - YC company directory: source of truth for confirmed YC companies.
 - YC Speedrun directory: separately tagged confirmed Speedrun signals.
 - Social discovery: Google News RSS queries for public X/LinkedIn-indexed founder announcements mentioning YC/Speedrun. These are explicitly treated as **lead signals**, not proof of YC membership.
+- Optional direct X API discovery when `X_BEARER_TOKEN` has the required X API access.
 - Persistent SQLite state prevents repeat alerts.
 - Slack bot posts incremental alerts to a configured channel.
-- Optional Pond webhook forwards monitoring events for agent/health infrastructure.
+- Pond Protocol V1 exposes `GET /manifest` and `POST /runs` so Pond can invoke the agent.
 
-## Important limitation
+## Important X API limitation
 
-Direct X and LinkedIn API access is not included. The social discovery layer uses public Google News RSS indexing of posts/pages. For stronger direct-platform coverage, set up approved X/LinkedIn API or an approved search provider and add an adapter under `poll_social_search()` without changing the alert/state interfaces.
+A valid X bearer token does not bypass X API plan/billing restrictions. If X returns HTTP 402, the agent logs the access limitation and continues with the other discovery layers. No X API billing is required for the repository to run its YC directory and indexed public discovery paths.
 
-## Render setup
+## Pond Protocol V1
 
-Create a **Background Worker** from this repository.
+The agent implements a synchronous Pond Protocol V1 action:
 
-- Language: Python 3
+- `GET /manifest` — public agent discovery.
+- `POST /runs` — authenticated synchronous execution of `scan_yc_signals`.
+- `GET /tasks/{task_id}` is not required because the agent advertises `async_tasks: false` and returns terminal HTTP 200 results.
+
+Configure the same `POND_ACCESS_KEY` on the deployed server and in Pond. Pond calls the public `/manifest` without authentication and sends the Access Key plus `X-Agent-Protocol-Version: 1.0` to `/runs`.
+
+## Render deployment
+
+Deploy this repository as a **Web Service**, not a Background Worker, because Pond needs a stable public HTTPS URL.
+
+This repository includes `render.yaml` for a Render web service.
+
+- Runtime: Python
 - Branch: `main`
 - Build command: `pip install -r requirements.txt`
 - Start command: `python app.py`
-- Compute: smallest plan suitable for your account
+- Health check: `/health`
 
-Environment variables:
+Set these environment variables/secrets in Render:
 
 ```text
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_CHANNEL_ID=C0BT5KFM8H5
+SLACK_CHANNEL_ID=C...
+POND_ACCESS_KEY=<a long random secret you create>
+X_BEARER_TOKEN=<optional X bearer token>
 POLL_HOURS=8
-GOOGLE_NEWS_ENABLED=true
-# Optional:
-POND_WEBHOOK_URL=https://...
-```
-
-Do not commit secrets to GitHub.
-
-### State
-
-For production, attach a persistent disk and set:
-
-```text
+SOCIAL_SEARCH_ENABLED=true
 DB_PATH=/var/data/state.db
 ```
 
-This keeps the seen-company state across deploys/restarts.
+`POND_WEBHOOK_URL` is optional and is only needed if you also want to forward normalized events to another Pond webhook/ingestion service.
+
+Do not commit secrets to GitHub.
+
+## Pond setup
+
+After the Render Web Service is deployed and healthy:
+
+1. Copy the public Render service URL, for example `https://your-agent.onrender.com`.
+2. Open Pond's **List Your Agent** page.
+3. Enter that HTTPS URL in **Agent URL**. Do not enter the GitHub repository URL.
+4. Continue to the next step.
+5. Configure the same `POND_ACCESS_KEY` value in Pond that you configured in Render.
+6. Let Pond fetch `/manifest` and validate the agent.
+7. Test the `Scan YC founder signals` action.
+
+The GitHub repository only supplies the source code. Pond must reach the deployed web service over HTTPS at runtime.
 
 ## Local run
 
@@ -57,6 +77,8 @@ python -m venv .venv
 pip install -r requirements.txt
 python app.py
 ```
+
+For local Pond testing, set `PORT=8000` and expose the server through a secure public HTTPS tunnel. Never expose the Pond access key in source code.
 
 ## Alert types
 
@@ -75,7 +97,3 @@ The YC directory is treated as the confirmation source.
 ## Future platform adapters
 
 The worker separates discovery, normalization, deduplication, and Slack delivery. Add adapters for X API, LinkedIn API, or additional platforms by emitting the same item shape (`key`, `source`, `company`, `url`, `text`) and passing it to `emit()`.
-
-## Pond
-
-Set `POND_WEBHOOK_URL` to the webhook/ingestion endpoint supplied by the Pond agent integration. Keep Pond credentials in Render secrets. The code forwards normalized signal events to Pond when configured.
