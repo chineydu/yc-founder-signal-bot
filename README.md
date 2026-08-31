@@ -8,7 +8,7 @@ A Slack monitoring agent for YC and YC Speedrun company signals, with a Pond Pro
 - YC Speedrun directory: separately tagged confirmed Speedrun signals.
 - Social discovery: Google News RSS queries for public X/LinkedIn-indexed founder announcements mentioning YC/Speedrun. These are explicitly treated as **lead signals**, not proof of YC membership.
 - Optional direct X API discovery when `X_BEARER_TOKEN` has the required X API access.
-- Persistent SQLite state prevents repeat alerts.
+- Persistent Postgres state prevents repeat alerts across monitoring runs and restarts.
 - Slack bot posts incremental alerts to a configured channel.
 - Pond Protocol V1 exposes `GET /manifest` and `POST /runs` so Pond can invoke the agent.
 
@@ -22,32 +22,31 @@ The agent implements a synchronous Pond Protocol V1 action:
 
 - `GET /manifest` — public agent discovery.
 - `POST /runs` — authenticated synchronous execution of `scan_yc_signals`.
-- `GET /tasks/{task_id}` is not required because the agent advertises `async_tasks: false` and returns terminal HTTP 200 results.
+- `GET /tasks/{task_id}` is exposed only as a compatibility probe; the agent advertises `async_tasks: false`.
 
 Configure the same `POND_ACCESS_KEY` on the deployed server and in Pond. Pond calls the public `/manifest` without authentication and sends the Access Key plus `X-Agent-Protocol-Version: 1.0` to `/runs`.
 
 ## Render deployment
 
-Deploy this repository as a **Web Service**, not a Background Worker, because Pond needs a stable public HTTPS URL.
+The repository uses two Render services:
 
-This repository includes `render.yaml` for a Render web service.
+1. **Web Service** — keeps the Pond HTTPS endpoint available.
+2. **Cron Job** — runs `worker.py` every 8 hours for persistent monitoring.
 
-- Runtime: Python
-- Branch: `main`
-- Build command: `pip install -r requirements.txt`
-- Start command: `python app.py`
-- Health check: `/health`
+Both services use the same Render Postgres database through `DATABASE_URL`, so deduplication survives restarts and separate cron executions.
 
-Set these environment variables/secrets in Render:
+The web service runs `python server.py`; the monitoring cron runs `python worker.py`.
+
+Required environment variables/secrets:
 
 ```text
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_CHANNEL_ID=C...
-POND_ACCESS_KEY=<a long random secret you create>
+POND_ACCESS_KEY=<the same key entered in Pond>
 X_BEARER_TOKEN=<optional X bearer token>
 POLL_HOURS=8
 SOCIAL_SEARCH_ENABLED=true
-DB_PATH=/var/data/state.db
+DATABASE_URL=<Render Postgres internal connection string>
 ```
 
 `POND_WEBHOOK_URL` is optional and is only needed if you also want to forward normalized events to another Pond webhook/ingestion service.
@@ -73,7 +72,6 @@ The GitHub repository only supplies the source code. Pond must reach the deploye
 ```bash
 python -m venv .venv
 # Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
 ```
