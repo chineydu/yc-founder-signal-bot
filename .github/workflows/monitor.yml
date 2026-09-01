@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
+    inputs:
+      test_slack:
+        description: "Send a controlled demo alert to Slack instead of running monitoring"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   monitor:
@@ -22,6 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore monitoring state
+        if: ${{ inputs.test_slack != true }}
         uses: actions/cache/restore@v4
         with:
           path: state.db
@@ -29,7 +36,32 @@ jobs:
           restore-keys: |
             yc-state-${{ runner.os }}-
 
+      - name: Send controlled Slack demo alert
+        if: ${{ inputs.test_slack == true }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          python - <<'PY'
+          import app
+          item = {
+              "text": "*YC FOUNDER SIGNAL BOT — LIVE DEMO*\n\n"
+                      "Company: Demo Labs\n"
+                      "Founder: Jane Demo (@demo_founder)\n"
+                      "Batch: YC S26\n"
+                      "Source: X\n"
+                      "Status: ⚡ Founder announcement detected before YC confirmation\n\n"
+                      "Original post: https://x.com/example/status/123456\n"
+                      "Company: https://example.com\n"
+                      "Detected: controlled Slack delivery test"
+          }
+          if not app.slack_alert(item):
+              raise SystemExit("Slack delivery test failed")
+          print("Slack delivery test succeeded")
+          PY
+
       - name: Run YC Founder Signal Monitor
+        if: ${{ inputs.test_slack != true }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -41,6 +73,7 @@ jobs:
         run: python -c "import app; app.run_once()"
 
       - name: Save monitoring state
+        if: ${{ inputs.test_slack != true }}
         uses: actions/cache/save@v4
         with:
           path: state.db
