@@ -1,6 +1,9 @@
 name: Slack Delivery Test
 
 on:
+  push:
+    paths:
+      - ".github/workflows/slack-test.yml"
   workflow_dispatch:
 
 jobs:
@@ -9,15 +12,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Send demo alert through the bot's Slack delivery code
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
