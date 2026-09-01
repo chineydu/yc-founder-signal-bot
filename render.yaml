@@ -13,6 +13,8 @@ services:
         value: "8"
       - key: SOCIAL_SEARCH_ENABLED
         value: "true"
+      - key: PUBLIC_X_SEARCH_ENABLED
+        value: "true"
       - key: DATABASE_URL
         fromDatabase:
           name: yc-founder-signal-db
@@ -41,6 +43,8 @@ services:
       - key: POLL_HOURS
         value: "8"
       - key: SOCIAL_SEARCH_ENABLED
+        value: "true"
+      - key: PUBLIC_X_SEARCH_ENABLED
         value: "true"
       - key: DATABASE_URL
         fromDatabase:
