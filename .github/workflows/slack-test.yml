@@ -1,0 +1,25 @@
+name: Slack Delivery Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-slack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send demo alert through the bot's Slack delivery code
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: python -c "import app; item={'text': '*YC FOUNDER SIGNAL BOT — LIVE DEMO*\\n\\nCompany: Demo Labs\\nFounder: Jane Demo (@demo_founder)\\nBatch: YC S26\\nSource: X\\nStatus: ⚡ Founder announcement detected before YC confirmation\\n\\nOriginal post: https://x.com/example/status/123456\\nCompany: https://example.com\\nDetected: demo delivery test'}; ok=app.slack_alert(item); raise SystemExit(0 if ok else 1)"
