@@ -1,0 +1,50 @@
+name: YC Confirmed Company Slack Demo
+
+on:
+  workflow_dispatch:
+
+jobs:
+  confirmed-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send confirmed YC directory demo to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.environ["SLACK_BOT_TOKEN"]
+          channel = os.environ["SLACK_CHANNEL_ID"]
+          yc_url = "https://www.ycombinator.com/companies/marker"
+
+          # Marker is a real S26 company currently listed in the official YC directory.
+          # This is deliberately labeled as a live directory-verification demo, not a
+          # claim that Marker was newly detected by this run.
+          text = (
+              "*NEW YC COMPANY — LIVE DIRECTORY VERIFICATION DEMO*\n\n"
+              "Company: Marker\n"
+              "Batch: YC S26\n"
+              "Source: YC Directory\n"
+              "Status: ✅ Confirmed by YC\n\n"
+              "Description: Marker embeds with companies, learns how their organization actually works, "
+              "and ships custom AI agents into production in weeks via the Marker Command Center.\n\n"
+              f"YC Profile: {yc_url}\n"
+              "Note: This is a live Slack delivery/format verification using a real YC-directory company; "
+              "it is not being presented as a newly discovered company."
+          )
+
+          response = requests.post(
+              "https://slack.com/api/chat.postMessage",
+              headers={"Authorization": f"Bearer {token}"},
+              json={"channel": channel, "text": text},
+              timeout=30,
+          )
+          response.raise_for_status()
+          data = response.json()
+          if not data.get("ok"):
+              raise SystemExit(f"Slack delivery failed: {data}")
+          print("Confirmed-company Slack demo delivered successfully")
+          PY
