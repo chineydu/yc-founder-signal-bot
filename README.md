@@ -6,15 +6,18 @@ A Slack monitoring agent for YC and YC Speedrun company signals, with a Pond Pro
 
 - YC company directory: source of truth for confirmed YC companies.
 - YC Speedrun directory: separately tagged confirmed Speedrun signals.
-- Social discovery: Google News RSS queries for public X/LinkedIn-indexed founder announcements mentioning YC/Speedrun. These are explicitly treated as **lead signals**, not proof of YC membership.
-- Optional direct X API discovery when `X_BEARER_TOKEN` has the required X API access.
-- Persistent Postgres state prevents repeat alerts across monitoring runs and restarts.
+- X: optional direct X API discovery plus a public-indexed fallback when the X API is unavailable or billing-limited.
+- LinkedIn: public-indexed discovery of LinkedIn posts/feed updates mentioning YC/Speedrun acceptance or founder announcements, plus company-page signals.
+- Social discovery is explicitly treated as **lead evidence**, not proof of YC membership. The YC Directory remains the confirmation source.
+- Persistent state prevents repeat alerts across monitoring runs.
 - Slack bot posts incremental alerts to a configured channel.
 - Pond Protocol V1 exposes `GET /manifest` and `POST /runs` so Pond can invoke the agent.
 
-## Important X API limitation
+## Social-source limitation
 
-A valid X bearer token does not bypass X API plan/billing restrictions. If X returns HTTP 402, the agent logs the access limitation and continues with the other discovery layers. No X API billing is required for the repository to run its YC directory and indexed public discovery paths.
+The public X and LinkedIn adapters use search-engine indexes because direct global post-search APIs are restricted or require approved access. Indexed discovery is therefore best-effort and is not guaranteed to find every post. A valid X bearer token does not bypass X API plan/billing restrictions; if X returns HTTP 402, the monitor continues with the public-indexed X and LinkedIn paths.
+
+The dedicated `linkedin_monitor.py` adapter searches separate LinkedIn post and company-page query families, normalizes canonical LinkedIn URLs, extracts batch/program hints, suppresses companies already present in the YC Directory, and routes first-seen results through the main `app.emit()` dedupe/Slack pipeline.
 
 ## Pond Protocol V1
 
@@ -33,9 +36,7 @@ The repository uses two Render services:
 1. **Web Service** — keeps the Pond HTTPS endpoint available.
 2. **Cron Job** — runs `worker.py` every 8 hours for persistent monitoring.
 
-Both services use the same Render Postgres database through `DATABASE_URL`, so deduplication survives restarts and separate cron executions.
-
-The web service runs `python server.py`; the monitoring cron runs `python worker.py`.
+The Render worker runs the normal monitor and then the dedicated LinkedIn indexed adapter, so the LinkedIn pass is also active outside GitHub Actions.
 
 Required environment variables/secrets:
 
@@ -46,12 +47,14 @@ POND_ACCESS_KEY=<the same key entered in Pond>
 X_BEARER_TOKEN=<optional X bearer token>
 POLL_HOURS=8
 SOCIAL_SEARCH_ENABLED=true
-DATABASE_URL=<Render Postgres internal connection string>
+DATABASE_URL=<Render Postgres/internal connection string if used by deployment>
 ```
 
-`POND_WEBHOOK_URL` is optional and is only needed if you also want to forward normalized events to another Pond webhook/ingestion service.
-
 Do not commit secrets to GitHub.
+
+## GitHub Actions
+
+The scheduled workflow runs every 6 hours and also supports a manual `workflow_dispatch` run. For a real monitoring run, leave **"Send a controlled demo alert to Slack instead of running monitoring" unchecked** (`test_slack=false`). The workflow runs the normal monitor and a dedicated LinkedIn indexed discovery pass, then saves state.
 
 ## Pond setup
 
@@ -65,7 +68,7 @@ After the Render Web Service is deployed and healthy:
 6. Let Pond fetch `/manifest` and validate the agent.
 7. Test the `Scan YC founder signals` action.
 
-The GitHub repository only supplies the source code. Pond must reach the deployed web service over HTTPS at runtime.
+The GitHub repository supplies the source code. Pond must reach the deployed web service over HTTPS at runtime.
 
 ## Local run
 
@@ -86,6 +89,12 @@ For local Pond testing, set `PORT=8000` and expose the server through a secure p
 
 The alert states that the social signal is not yet confirmed by the YC Directory. This avoids waiting for an official YC social post.
 
+**LinkedIn company-page signal**
+
+`LINKEDIN YC SIGNAL — COMPANY PAGE`
+
+Company-page discovery is clearly labelled as an indexed signal because public indexing does not reliably expose page creation time.
+
 **Confirmed YC**
 
 `NEW YC COMPANY` / `NEW YC SPEEDRUN COMPANY`
@@ -94,4 +103,4 @@ The YC directory is treated as the confirmation source.
 
 ## Future platform adapters
 
-The worker separates discovery, normalization, deduplication, and Slack delivery. Add adapters for X API, LinkedIn API, or additional platforms by emitting the same item shape (`key`, `source`, `company`, `url`, `text`) and passing it to `emit()`.
+Discovery, normalization, deduplication, and Slack delivery are separated. Add another platform by emitting the same item shape (`key`, `source`, `company`, `url`, `text`) and routing it through `app.emit()`.
