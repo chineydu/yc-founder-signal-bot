@@ -30,7 +30,7 @@ YC_TERMS = (
     "joined yc", "joining yc", "speedrun batch", "yc speedrun", "accepted to speedrun",
 )
 ANNOUNCEMENT_TERMS = ("got into", "accepted", "backed", "joined yc", "joining yc", "join yc", "selected", "speedrun batch", "accepted to speedrun")
-LINKEDIN_POST_RE = re.compile(r'https?://(?:[a-z]{2,3}\.)?(?:www\.)?linkedin\.com/(?:posts/[^\s?#<>"\']+|feed/update/[^\s?#<>"\']+)', re.I)
+LINKEDIN_POST_RE = re.compile(r"https?://(?:[a-z]{2,3}\\.)?(?:www\\.)?linkedin\\.com/(?:posts/[^\\s?#<>\"']+|feed/update/[^\\s?#<>\"']+)", re.I)
 
 
 def normalize_linkedin_url(url: str) -> str:
