@@ -1,24 +1,18 @@
-"""LinkedIn discovery adapter for the YC Founder Signal Monitor.
+"""Public-indexed LinkedIn discovery adapter for the YC Founder Signal Monitor.
 
-This adapter intentionally uses public, indexed LinkedIn discovery for broad
-founder/company discovery. LinkedIn's authenticated Posts API is author- or
-organization-scoped and requires approved permissions, so it is an optional
-enrichment path rather than a fake "global LinkedIn search" API.
+LinkedIn does not expose a general authenticated global-post search endpoint
+without approved API access. This adapter therefore searches public search-engine
+indexes for LinkedIn posts and company pages. It never presents an indexed result
+as proof of YC membership: the YC Directory remains the confirmation source.
 
-The monitor:
-- searches several LinkedIn-specific public queries;
-- normalizes LinkedIn URLs and extracts a useful author/company hint;
-- requires YC/Speedrun acceptance language;
-- suppresses companies already present in the YC directory;
-- emits first-seen alerts to Slack with a stable dedupe key.
-
-It is safe to run independently from app.py and is used by the scheduled
-GitHub Actions monitor.
+The adapter is deliberately separated from Slack delivery. The main monitor can
+pass ``app.emit`` so all platforms share the same persistent dedupe store.
 """
 
 from __future__ import annotations
 
 import hashlib
+import html
 import os
 import re
 import sqlite3
@@ -28,6 +22,26 @@ from urllib.parse import quote_plus, urlparse
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+
+SEARCH_ENGINES = (
+    "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+    "https://www.bing.com/news/search?q={query}&format=rss",
+)
+
+# Keep post searches separate from company-page searches. Post results are the
+# high-value path for the task's "founder announced before YC" requirement.
+LINKEDIN_POST_QUERIES = (
+    'site:linkedin.com/posts ("got into YC" OR "accepted into YC" OR "accepted by Y Combinator")',
+    'site:linkedin.com/feed/update ("got into YC" OR "accepted into YC" OR "accepted by Y Combinator")',
+    'site:linkedin.com/posts ("YC S26" OR "YC W26" OR "Y Combinator S26" OR "Y Combinator W26")',
+    'site:linkedin.com/posts ("backed by Y Combinator" OR "joined YC" OR "joining YC")',
+    'site:linkedin.com/posts ("Speedrun batch" OR "YC Speedrun" OR "accepted to Speedrun")',
+)
+
+LINKEDIN_COMPANY_QUERIES = (
+    'site:linkedin.com/company ("YC S26" OR "YC W26" OR "Y Combinator")',
+    'site:linkedin.com/company ("Speedrun" OR "Y Combinator") "2026"',
+)
 
 YC_TERMS = (
     "got into yc",
@@ -39,8 +53,11 @@ YC_TERMS = (
     "y combinator s26",
     "y combinator w26",
     "backed by y combinator",
+    "joined yc",
+    "joining yc",
     "speedrun batch",
     "yc speedrun",
+    "accepted to speedrun",
 )
 
 ANNOUNCEMENT_TERMS = (
@@ -48,49 +65,102 @@ ANNOUNCEMENT_TERMS = (
     "accepted",
     "backed",
     "joined yc",
+    "joining yc",
     "join yc",
-    "yc s26",
-    "yc w26",
     "selected",
-    "speedrun",
+    "speedrun batch",
+    "accepted to speedrun",
 )
 
-LINKEDIN_QUERIES = (
-    'site:linkedin.com/posts ("got into YC" OR "accepted into YC" OR "YC S26" OR "Y Combinator")',
-    'site:linkedin.com/feed/update ("got into YC" OR "accepted into YC" OR "YC S26" OR "Y Combinator")',
-    'site:linkedin.com/company ("YC S26" OR "Y Combinator" OR "Speedrun")',
-    'site:linkedin.com/posts ("backed by Y Combinator" OR "Speedrun batch" OR "YC Speedrun")',
-    'site:linkedin.com/company ("Y Combinator" OR "Speedrun") "2026"',
+LINKEDIN_POST_RE = re.compile(
+    r"https?://(?:[a-z]{2,3}\\.)?(?:www\\.)?linkedin\\.com/(?:posts/[^\\s?#<>"]+|feed/update/[^\\s?#<>"]+)",
+    re.I,
+)
+LINKEDIN_COMPANY_RE = re.compile(
+    r"https?://(?:[a-z]{2,3}\\.)?(?:www\\.)?linkedin\\.com/company/[^\\s?#<>"]+",
+    re.I,
 )
 
 
 def normalize_linkedin_url(url: str) -> str:
-    """Return a stable LinkedIn URL without tracking parameters/fragments."""
+    """Normalize a LinkedIn URL for stable links and deduplication."""
     if not url:
         return ""
-    parsed = urlparse(url)
+    parsed = urlparse(html.unescape(url))
     if "linkedin.com" not in parsed.netloc.lower():
-        return url
+        return ""
     path = parsed.path.rstrip("/")
     return f"https://www.linkedin.com{path}"
 
 
-def is_linkedin_url(url: str) -> bool:
-    return "linkedin.com" in urlparse(url).netloc.lower()
+def _entry_text(entry) -> str:
+    parts = []
+    for value in (entry.get("title", ""), entry.get("summary", "")):
+        if value:
+            parts.append(BeautifulSoup(value, "html.parser").get_text(" ", strip=True))
+    for item in entry.get("content", []):
+        value = item.get("value")
+        if value:
+            parts.append(BeautifulSoup(value, "html.parser").get_text(" ", strip=True))
+    return " ".join(parts).strip()
+
+
+def _resolve_search_link(link: str) -> str:
+    """Follow a search-feed redirect and return its final URL when possible."""
+    if not link:
+        return ""
+    if "linkedin.com" in urlparse(link).netloc.lower():
+        return link
+    try:
+        response = requests.get(
+            link,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; YCFounderSignal/1.0)"},
+            timeout=10,
+            allow_redirects=True,
+        )
+        return response.url or ""
+    except requests.RequestException:
+        return ""
+
+
+def _canonical_url(entry, kind: str) -> str:
+    text = _entry_text(entry)
+    pattern = LINKEDIN_POST_RE if kind == "post" else LINKEDIN_COMPANY_RE
+    for candidate in pattern.findall(html.unescape(text)):
+        normalized = normalize_linkedin_url(candidate)
+        if normalized:
+            return normalized
+
+    raw = entry.get("link", "")
+    resolved = _resolve_search_link(raw)
+    if resolved:
+        match = pattern.search(resolved)
+        if match:
+            return normalize_linkedin_url(match.group(0))
+    return ""
 
 
 def is_early_yc_signal(text: str) -> bool:
     hay = text.casefold()
-    return any(term in hay for term in YC_TERMS) and any(
-        term in hay for term in ANNOUNCEMENT_TERMS
-    )
+    has_yc = any(term in hay for term in YC_TERMS)
+    has_announcement = any(term in hay for term in ANNOUNCEMENT_TERMS)
+    return has_yc and has_announcement
+
+
+def infer_batch(text: str) -> str:
+    match = re.search(r"\\b(?:YC|Y Combinator)\\s*([SW])\\s*(\\d{2})\\b", text, re.I)
+    if match:
+        return f"YC {match.group(1).upper()}{match.group(2)}"
+    if "speedrun" in text.casefold():
+        return "YC Speedrun"
+    return "YC / Speedrun (from post)"
 
 
 def infer_company(text: str) -> str:
     patterns = (
-        r"([A-Z][A-Za-z0-9&._-]*(?:\s+[A-Z][A-Za-z0-9&._-]*){0,4})\s*\(YC\s*[SP]\d{2}\)",
-        r"(?:building|founded|founder of|co-founded|cofounder of|launching|launched)\s+([A-Z][A-Za-z0-9&._-]*(?:\s+[A-Z][A-Za-z0-9&._-]*){0,4})",
-        r"(?:startup|company)\s+(?:called|named)\s+([A-Z][A-Za-z0-9&._-]*(?:\s+[A-Z][A-Za-z0-9&._-]*){0,4})",
+        r"([A-Z][A-Za-z0-9&._-]*(?:\\s+[A-Z][A-Za-z0-9&._-]*){0,4})\\s*\\(YC\\s*[SW]\\d{2}\\)",
+        r"(?:building|founded|founder of|co-founded|cofounder of|launching|launched)\\s+([A-Z][A-Za-z0-9&._-]*(?:\\s+[A-Z][A-Za-z0-9&._-]*){0,4})",
+        r"(?:startup|company)\\s+(?:called|named)\\s+([A-Z][A-Za-z0-9&._-]*(?:\\s+[A-Z][A-Za-z0-9&._-]*){0,4})",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -100,11 +170,9 @@ def infer_company(text: str) -> str:
 
 
 def infer_author(text: str, fallback: str = "Unknown founder") -> str:
-    # Google News RSS commonly supplies the publisher/author separately; this
-    # catches common title patterns when it does not.
     patterns = (
-        r"^([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s+(?:announces|shares|says|joins)",
-        r"by\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})",
+        r"^([A-Z][A-Za-z.'-]+(?:\\s+[A-Z][A-Za-z.'-]+){1,3})\\s+(?:announces|shares|says|joins)",
+        r"\\bby\\s+([A-Z][A-Za-z.'-]+(?:\\s+[A-Z][A-Za-z.'-]+){1,3})\\b",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -113,16 +181,50 @@ def infer_author(text: str, fallback: str = "Unknown founder") -> str:
     return fallback or "Unknown founder"
 
 
-def _rss(query: str):
-    url = (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(query)
-        + "&hl=en-US&gl=US&ceid=US:en"
-    )
-    return feedparser.parse(url)
+def _search_feed(query: str):
+    encoded = quote_plus(query)
+    for template in SEARCH_ENGINES:
+        url = template.format(query=encoded)
+        try:
+            feed = feedparser.parse(url)
+        except Exception:
+            continue
+        if getattr(feed, "bozo", False) and not feed.entries:
+            continue
+        yield from feed.entries[:40]
 
 
-def _seen_store(path: str, key: str) -> bool:
+def search_public_linkedin(queries=None, max_entries: int = 40):
+    """Yield normalized public-indexed LinkedIn candidates.
+
+    ``kind`` is ``post`` for a LinkedIn post/feed-update result and
+    ``company_page`` for a LinkedIn company-page result. Company-page results
+    are never labelled as founder announcements because public indexing does
+    not reliably expose page creation time.
+    """
+    queries = tuple(queries or LINKEDIN_POST_QUERIES)
+    seen_urls: set[str] = set()
+    for query in queries:
+        for entry in _search_feed(query):
+            text = _entry_text(entry)
+            if not is_early_yc_signal(text):
+                continue
+            kind = "post" if "linkedin.com/posts" in query or "linkedin.com/feed/update" in query else "company_page"
+            link = _canonical_url(entry, kind)
+            if not link or link in seen_urls:
+                continue
+            seen_urls.add(link)
+            yield {
+                "url": link,
+                "text": text,
+                "author": entry.get("author", "") or infer_author(text),
+                "published": entry.get("published", ""),
+                "kind": kind,
+                "batch": infer_batch(text),
+            }
+
+
+def _local_seen(path: str, key: str) -> bool:
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS linkedin_seen "
@@ -133,7 +235,7 @@ def _seen_store(path: str, key: str) -> bool:
     return row is not None
 
 
-def _mark_seen(path: str, key: str, url: str, company: str) -> None:
+def _local_mark(path: str, key: str, url: str, company: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS linkedin_seen "
@@ -163,51 +265,62 @@ def _slack_alert(text: str) -> None:
         raise RuntimeError(f"Slack error: {data}")
 
 
-def run_linkedin_monitor(yc_company_names: set[str]) -> int:
-    """Run one LinkedIn discovery cycle. Returns number of new signals."""
+def _alert_text(candidate: dict, company: str) -> str:
+    if candidate["kind"] == "company_page":
+        status = "⚠️ LinkedIn-indexed company-page signal; page creation date is not publicly verifiable"
+        heading = "LINKEDIN YC SIGNAL — COMPANY PAGE"
+    else:
+        status = "⚡ Founder/social announcement detected; not yet confirmed by YC Directory"
+        heading = "EARLY YC SIGNAL — Founder Announced Before YC"
+    return (
+        f"*{heading}*\n\n"
+        f"Company: {company}\n"
+        f"Founder: {candidate['author']}\n"
+        f"Batch/program: {candidate['batch']}\n"
+        "Source: LinkedIn (public indexed discovery)\n"
+        f"Status: {status}\n\n"
+        f"Original post/page: {candidate['url']}\n\n"
+        f"Post text: {candidate['text'][:1200]}"
+    )
+
+
+def run_linkedin_monitor(yc_company_names: set[str], emit_callback=None) -> int:
+    """Run one LinkedIn discovery cycle and return the number of new alerts."""
     state_path = os.getenv("DB_PATH", "state.db")
     emitted = 0
-    for query in LINKEDIN_QUERIES:
-        for entry in _rss(query).entries[:50]:
-            link = normalize_linkedin_url(entry.get("link", ""))
-            if not is_linkedin_url(link):
-                continue
+    yc_names = {name.casefold() for name in yc_company_names}
+    for candidate in search_public_linkedin():
+        company = infer_company(candidate["text"])
+        if company.casefold() in yc_names:
+            # YC Directory is the source of truth. Do not turn an already
+            # confirmed company into an "early" social signal.
+            continue
 
-            title = entry.get("title", "")
-            summary = BeautifulSoup(
-                entry.get("summary", ""), "html.parser"
-            ).get_text(" ", strip=True)
-            text = f"{title} {summary}".strip()
-            if not is_early_yc_signal(text):
+        key = f"social:LinkedIn:{candidate['url']}"
+        if emit_callback is not None:
+            item = {
+                "key": key,
+                "source": "LinkedIn",
+                "company": company,
+                "url": candidate["url"],
+                "text": _alert_text(candidate, company),
+            }
+            before = _local_seen(state_path, hashlib.sha256(key.encode()).hexdigest()[:32])
+            emit_callback(item)
+            # ``app.emit`` owns the authoritative dedupe store. The local check
+            # is only used to make the returned count useful without changing
+            # app.py's semantics.
+            if not before:
+                emitted += 1
+        else:
+            stable = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+            if _local_seen(state_path, stable):
                 continue
-
-            company = infer_company(text)
-            if company.casefold() in {x.casefold() for x in yc_company_names}:
-                # This is already confirmed by YC; it is not an early signal.
-                continue
-
-            author = infer_author(text, entry.get("author", "Unknown founder"))
-            stable = hashlib.sha256(link.encode("utf-8")).hexdigest()[:32]
-            if _seen_store(state_path, stable):
-                continue
-
-            alert = (
-                "*EARLY YC SIGNAL — Founder Announced Before YC*\n\n"
-                f"Company: {company}\n"
-                f"Founder: {author}\n"
-                "Batch/program: YC / Speedrun (from post)\n"
-                "Source: LinkedIn\n"
-                "Status: ⚡ Founder/social announcement detected; not yet confirmed by YC Directory\n\n"
-                f"Original post: {link}\n\n"
-                f"Post text: {text[:1200]}"
-            )
-            _slack_alert(alert)
-            _mark_seen(state_path, stable, link, company)
+            _slack_alert(_alert_text(candidate, company))
+            _local_mark(state_path, stable, candidate["url"], company)
             emitted += 1
     return emitted
 
 
 if __name__ == "__main__":
-    # Standalone smoke mode. The main monitor supplies the YC directory names
-    # during normal scheduled execution.
     print(run_linkedin_monitor(set()), "new LinkedIn signals")
