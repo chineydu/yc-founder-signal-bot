@@ -68,9 +68,25 @@ jobs:
           POND_WEBHOOK_URL: ${{ secrets.POND_WEBHOOK_URL }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           SOCIAL_SEARCH_ENABLED: "true"
+          PUBLIC_X_SEARCH_ENABLED: "true"
           POLL_HOURS: "6"
           DB_PATH: "state.db"
         run: python -c "import app; app.run_once()"
+
+      - name: Run dedicated LinkedIn indexed discovery
+        if: ${{ inputs.test_slack != true && env.SOCIAL_SEARCH_ENABLED != 'false' }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SOCIAL_SEARCH_ENABLED: "true"
+          DB_PATH: "state.db"
+        run: |
+          python - <<'PY'
+          import app
+          from linkedin_monitor import run_linkedin_monitor
+          count = run_linkedin_monitor(app.yc_company_names(), emit_callback=app.emit)
+          print(f"Dedicated LinkedIn indexed discovery completed: {count} candidate(s)")
+          PY
 
       - name: Save monitoring state
         if: ${{ inputs.test_slack != true }}
