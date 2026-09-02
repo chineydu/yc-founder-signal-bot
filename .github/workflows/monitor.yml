@@ -74,7 +74,7 @@ jobs:
         run: python -c "import app; app.run_once()"
 
       - name: Run dedicated LinkedIn indexed discovery
-        if: ${{ inputs.test_slack != true && env.SOCIAL_SEARCH_ENABLED != 'false' }}
+        if: ${{ inputs.test_slack != true }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
